@@ -5,6 +5,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
 
+# Base class for all models (defined before model imports)
+Base = declarative_base()
+
 # Create sync engine (psycopg supports sync only)
 engine = create_engine(
     settings.database_url,
@@ -19,8 +22,10 @@ SessionLocal = sessionmaker(
     future=True,
 )
 
-# Base class for all models
-Base = declarative_base()
+
+# Import all models to register them with Base
+from app.idempotency import ProcessedEvent  # noqa: F401, E402
+from app.models import Order, OrderStatus, OutboxEvent  # noqa: F401, E402
 
 
 def get_session():
