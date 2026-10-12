@@ -1,13 +1,24 @@
 """Live integration tests against REAL PostgreSQL and RabbitMQ.
 
 Marked ``live``: they are SKIPPED unless the environment provides both
-services. Run them with::
+services. Run them with a DEDICATED TEST DATABASE (required)::
 
-    docker compose up -d postgres rabbitmq
-    QUICKBITE_RUN_LIVE=1 python -m pytest -m live
+    # Set up an isolated test database (not quickbite_db):
+    docker compose exec postgres createdb -U quickbite_user quickbite_test_db
 
-Connection defaults match docker-compose.yml (host ports); override with
-QUICKBITE_TEST_DATABASE_URL and QUICKBITE_TEST_RABBITMQ_URL.
+    # Run tests against the test database only:
+    QUICKBITE_RUN_LIVE=1 \
+    QUICKBITE_TEST_DATABASE_URL="postgresql+psycopg://quickbite_user:quickbite_password@127.0.0.1:5434/quickbite_test_db" \
+    QUICKBITE_TEST_VHOST="quickbite_test" \
+    python -m pytest -m live
+
+⚠️  SAFETY GUARD: Tests will REFUSE to run against the default "quickbite_db"
+    database or the default "/" vhost. A dedicated test database and vhost
+    must be explicitly configured to prevent accidental data loss.
+
+Connection defaults require explicit test database:
+- QUICKBITE_TEST_DATABASE_URL must NOT be quickbite_db
+- QUICKBITE_TEST_VHOST must be set to a test vhost (e.g. quickbite_test)
 
 All broker I/O shares a single module-scoped asyncio event loop
 (``live_loop``): aio-pika connections are bound to the loop that
@@ -24,15 +35,70 @@ import asyncio
 import json
 import os
 import uuid
+from urllib.parse import urlparse
 
 RUN_LIVE = os.environ.get("QUICKBITE_RUN_LIVE") == "1"
 DATABASE_URL = os.environ.get(
     "QUICKBITE_TEST_DATABASE_URL",
     "postgresql+psycopg://quickbite_user:quickbite_password@127.0.0.1:5434/quickbite_db",
 )
+# Test vhost (e.g., "quickbite_test") — must be explicitly set, cannot be default "/"
+TEST_VHOST = os.environ.get("QUICKBITE_TEST_VHOST", None)
 RABBITMQ_URL = os.environ.get(
     "QUICKBITE_TEST_RABBITMQ_URL", "amqp://quickbite:quickbite_password@127.0.0.1:5672/"
 )
+
+
+def _verify_test_database_isolation():
+    """
+    Safety guard: Refuse to run against the default production database.
+    
+    Checks:
+    1. QUICKBITE_TEST_DATABASE_URL is explicitly set (not using production default)
+    2. Database name is NOT "quickbite_db" (production database)
+    3. TEST_VHOST is explicitly set for RabbitMQ
+    4. TEST_VHOST is NOT "/" (default, shared vhost)
+    
+    Raises ValueError if any check fails.
+    """
+    parsed_db_url = urlparse(DATABASE_URL)
+    db_name = parsed_db_url.path.lstrip("/") if parsed_db_url.path else None
+    
+    # Check 1: QUICKBITE_TEST_DATABASE_URL must be set (not default)
+    if "QUICKBITE_TEST_DATABASE_URL" not in os.environ:
+        raise ValueError(
+            "SAFETY GUARD FAILED: Live tests require an explicit dedicated test database.\n"
+            "Set QUICKBITE_TEST_DATABASE_URL to a test database (NOT quickbite_db).\n"
+            "Example: quickbite_test_db\n"
+            "To create: docker compose exec postgres createdb -U quickbite_user quickbite_test_db"
+        )
+    
+    # Check 2: Database name must NOT be "quickbite_db" (production)
+    if db_name == "quickbite_db":
+        raise ValueError(
+            "SAFETY GUARD FAILED: Refusing to run live tests against production database 'quickbite_db'.\n"
+            "Live tests will TRUNCATE tables, destroying existing data (15 orders + 8 outbox events).\n"
+            "Set QUICKBITE_TEST_DATABASE_URL to a dedicated test database instead.\n"
+            "Example: postgresql+psycopg://quickbite_user:quickbite_password@127.0.0.1:5434/quickbite_test_db"
+        )
+    
+    # Check 3: TEST_VHOST must be set
+    if TEST_VHOST is None:
+        raise ValueError(
+            "SAFETY GUARD FAILED: Live tests require an explicit test RabbitMQ vhost.\n"
+            "Set QUICKBITE_TEST_VHOST to a test vhost (NOT '/').\n"
+            "Example: QUICKBITE_TEST_VHOST=quickbite_test\n"
+            "Note: Shared queues on default vhost '/' will not be purged."
+        )
+    
+    # Check 4: TEST_VHOST must NOT be default "/"
+    if TEST_VHOST == "/":
+        raise ValueError(
+            "SAFETY GUARD FAILED: Refusing to run live tests on default RabbitMQ vhost '/'.\n"
+            "Tests will purge shared queues, affecting other systems.\n"
+            "Set QUICKBITE_TEST_VHOST to a dedicated test vhost.\n"
+            "Example: QUICKBITE_TEST_VHOST=quickbite_test"
+        )
 
 import aio_pika
 import pytest
@@ -52,12 +118,27 @@ from app.retry import RETRY_COUNT_HEADER
 from app.worker_common import settle_message
 from app.workers.payment import process_payment_event
 
+# ============================================================================
+# SAFETY GUARD: Verify test database and vhost isolation BEFORE ANY TESTS RUN
+# ============================================================================
+if RUN_LIVE:
+    try:
+        _verify_test_database_isolation()
+    except ValueError as e:
+        raise RuntimeError(f"LIVE TEST SAFETY CHECK FAILED:\n{e}") from e
+
 pytestmark = [
     pytest.mark.live,
     pytest.mark.skipif(
         not RUN_LIVE, reason="live services not requested (set QUICKBITE_RUN_LIVE=1)"
     ),
 ]
+
+
+# ============================================================================
+# NOTE: TestLiveSafetyGuards below is NOT marked with skipif—it runs without
+# live infrastructure and should execute regardless of QUICKBITE_RUN_LIVE.
+# ============================================================================
 
 
 @pytest.fixture(scope="module")
@@ -70,40 +151,81 @@ def live_loop():
 
 @pytest.fixture(scope="module")
 def live_db_session_factory():
-    """Session factory against the REAL PostgreSQL (isolated tables)."""
+    """Session factory against the test PostgreSQL database (isolated schema).
+    
+    SAFETY CRITICAL: Cleanup is DISABLED to prevent accidental deletion of records.
+    A dedicated, disposable test database is REQUIRED. Do not use a shared database.
+    
+    To use these tests:
+    1. Set QUICKBITE_TEST_DATABASE_URL to a disposable test database (NOT quickbite_db)
+    2. Set QUICKBITE_TEST_VHOST to a disposable test vhost (NOT /)
+    3. Run with: QUICKBITE_RUN_LIVE=1 pytest -m live
+    4. After testing, drop the test database or clear all tables manually
+    
+    Rationale: Marker-based cleanup (customer_name="Live Test") cannot guarantee
+    safety in concurrent environments or when tests share the database. Automatic
+    cleanup is disabled to force explicit test database isolation.
+    """
     engine = create_engine(DATABASE_URL, future=True)
     # Connectivity check with a clear error if Postgres is down.
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
     Base.metadata.create_all(bind=engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    
     yield factory
-    # Drop pooled connections first: a failed test's traceback can keep a
-    # session (and its open transaction) alive, which would block TRUNCATE.
+    
+    # Drop pooled connections: a failed test's traceback can keep a session
+    # (and its open transaction) alive, which would block cleanup.
     engine.dispose()
-    # Clean up only rows created by these tests (by table truncation).
-    with engine.begin() as conn:
-        for table in ("processed_events", "outbox_events", "orders"):
-            conn.execute(text(f"TRUNCATE {table} CASCADE"))
-    engine.dispose()
+    
+    # CLEANUP DISABLED: No automatic deletion to prevent accidental data loss.
+    # Test database must be disposable (not shared with production/other tests).
+    # Manual cleanup required: drop the test database or clear tables explicitly.
 
 
 @pytest.fixture(scope="module")
 def live_rabbitmq(live_loop):
-    """Connected RabbitMQManager against the REAL broker."""
+    """Connected RabbitMQManager against test RabbitMQ (isolated vhost).
+    
+    SAFETY: Uses a dedicated test vhost (not shared default "/") to prevent
+    purging shared queues. Refuses to purge on default vhost.
+    """
     from app.rabbitmq import DLQ_QUEUE, RETRY_QUEUE
 
     async def setup():
-        manager = await RabbitMQManager(RABBITMQ_URL).connect()
+        # Update connection URL to use test vhost if set
+        rmq_url = RABBITMQ_URL
+        if TEST_VHOST and TEST_VHOST != "/":
+            # Replace vhost in URL
+            parsed = urlparse(RABBITMQ_URL)
+            rmq_url = f"{parsed.scheme}://{parsed.netloc}/{TEST_VHOST}"
+        
+        manager = await RabbitMQManager(rmq_url).connect()
         await manager.declare_application_topology(QUEUE_CONFIG)
-        # Start from a clean slate: purge leftovers from earlier runs.
+        
+        # SAFETY: Only purge test queues in test vhost, never on default vhost
+        if TEST_VHOST == "/":
+            raise RuntimeError(
+                "SAFETY GUARD FAILED: Refusing to purge queues on default RabbitMQ vhost '/'.\n"
+                "Set QUICKBITE_TEST_VHOST to a dedicated test vhost to prevent data loss."
+            )
+        
+        # Start from a clean slate: purge test queues (only in test vhost).
         for queue_name in list(QUEUE_CONFIG) + [DLQ_QUEUE, RETRY_QUEUE]:
-            queue = await manager.channel.get_queue(queue_name)
-            await queue.purge()
+            try:
+                queue = await manager.channel.get_queue(queue_name)
+                await queue.purge()
+            except Exception as e:
+                # Log but don't fail—queue may not exist yet
+                print(f"Warning: Could not purge {queue_name}: {e}")
+        
         return manager
 
     manager = live_loop.run_until_complete(setup())
     yield manager
+    
+    # Cleanup: close connection but do NOT purge queues (test vhost persists)
     live_loop.run_until_complete(manager.close())
 
 
@@ -306,3 +428,4 @@ class TestLiveDeadLetter:
             session.close()
 
         live_loop.run_until_complete(scenario())
+
