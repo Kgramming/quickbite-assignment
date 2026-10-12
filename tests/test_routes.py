@@ -4,6 +4,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def test_root_route_serves_frontend(client: TestClient):
+    """Test that GET / serves HTML frontend (not JSON)."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert "<!DOCTYPE html>" in response.text
+    assert "QuickBite" in response.text
+
+
 def test_health_check_broker_down(client: TestClient, monkeypatch):
     """Health is 'degraded' when RabbitMQ is unreachable (mocked).
 

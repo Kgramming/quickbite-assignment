@@ -159,14 +159,3 @@ def get_order(
         )
 
     return OrderResponse.model_validate(order)
-
-
-@router.get("/", include_in_schema=False, tags=["frontend"])
-def serve_frontend():
-    """Serve QuickBite frontend."""
-    from fastapi.responses import FileResponse
-    from pathlib import Path
-    index_file = Path(__file__).parent / "static" / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file, media_type="text/html")
-    return {"message": "QuickBite Frontend - Navigate to /docs for API documentation"}

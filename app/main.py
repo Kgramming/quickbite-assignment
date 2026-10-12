@@ -52,22 +52,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routes
-app.include_router(router)
-
-# Serve static files (QuickBite frontend)
-static_dir = Path(__file__).parent / "static"
-if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-# Serve index.html at root
+# Serve index.html at root (BEFORE including router, so it takes precedence over any router "/"
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
-    """Serve QuickBite frontend."""
-    index_file = static_dir / "index.html"
+    """Serve QuickBite frontend HTML."""
+    index_file = Path(__file__).parent / "static" / "index.html"
     if index_file.exists():
         return FileResponse(index_file, media_type="text/html")
     return {"message": "QuickBite Frontend not found"}
+
+# Include routes
+app.include_router(router)
+
+# Serve static files (QuickBite frontend assets)
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 if __name__ == "__main__":
