@@ -259,20 +259,107 @@ docker-compose down
 docker-compose down -v
 ```
 
-## Known Limitations (Phase 1)
+## Known Limitations & Future Work (Phase 3)
 
-1. **Outbox Publisher Not Implemented**: Orders are created with outbox events, but they are not yet published to RabbitMQ. This will be implemented in Phase 2.
-2. **Workers Not Implemented**: Payment, Restaurant, Delivery, and Notification consumers are not yet implemented.
-3. **No Async Task Runner**: Background job scheduling is not yet implemented.
+1. **Mock Payment Processor**: Production would integrate Stripe, PayPal, or similar
+2. **Mock Notifications**: Production would use SendGrid, Twilio, or similar
+3. **No Monitoring**: Prometheus, Grafana, or distributed tracing not included
+4. **No Encryption**: Messages sent in plaintext (acceptable for test environment)
+5. **DLQ Manual Inspection**: Dead-letter queue messages cannot be replayed automatically
+6. **Single-Instance Workers**: No coordination between multiple instances
 
-## What's Next (Phase 2)
+## Phase 2: Worker Execution & Outbox Publishing
 
-1. Implement OutboxPublisher worker that polls the outbox table and publishes events to RabbitMQ
-2. Implement four independent consumer workers with manual acknowledgements and idempotent processing
-3. Add order status transitions driven by consumer events
-4. Implement dead-letter queue handling and retry logic
-5. Add comprehensive integration tests
-6. Deploy to isolated Docker network with worker scaling support
+### Overview
+
+Phase 2 implements reliable asynchronous messaging with four independent worker processes:
+
+1. **Payment Worker**: Processes payments (PENDING → PAID or PAYMENT_FAILED)
+2. **Restaurant Worker**: Confirms orders (PAID → CONFIRMED)
+3. **Delivery Worker**: Assigns drivers (CONFIRMED → DRIVER_ASSIGNED)
+4. **Notification Worker**: Sends notifications (read-only)
+
+### Running Workers
+
+In separate terminal windows:
+
+```bash
+# Terminal 2: Start outbox publisher
+python3 -m app.outbox_publisher
+
+# Terminal 3: Start payment worker
+python3 -m app.worker_service payment
+
+# Terminal 4: Start restaurant worker
+python3 -m app.worker_service restaurant
+
+# Terminal 5: Start delivery worker
+python3 -m app.worker_service delivery
+
+# Terminal 6: Start notification worker
+python3 -m app.worker_service notification
+```
+
+### Order Status Flow
+
+```
+┌─────────────┐
+│   PENDING   │  (order created via API)
+└──────┬──────┘
+       │ payment.queue
+       ▼
+┌─────────────────┐
+│ PAID or FAILED  │  (payment worker processes)
+└────────┬────────┘
+         │ (only PAID progresses)
+         ▼
+┌─────────────────┐
+│   CONFIRMED     │  (restaurant worker confirms)
+└────────┬────────┘
+         │ restaurant.queue
+         ▼
+┌─────────────────┐
+│ DRIVER_ASSIGNED │  (delivery worker assigns)
+└─────────────────┘
+```
+
+### Reliability Features
+
+- **Durable Queues**: Messages survive broker restarts
+- **Persistent Messages**: PERSISTENT delivery mode
+- **Publisher Confirms**: Outbox events marked published only after broker ACK
+- **Idempotent Consumers**: Database prevents duplicate processing
+- **Manual Acknowledgements**: Workers acknowledge only after database commit
+- **Dead-Letter Queue**: Failed messages go to `orders.dead-letter.queue`
+- **State Machine Enforcement**: Workers check current status before transitioning
+
+### Testing Phase 2
+
+```bash
+# Run all 27 tests (17 Phase 1 + 10 Phase 2)
+pytest tests/ -v
+
+# Run only Phase 2 integration tests
+pytest tests/test_integration.py -v
+
+# Run specific test
+pytest tests/test_integration.py::TestOrderFlow::test_payment_success_flow -v
+```
+
+### Demo Script
+
+An interactive demo shows successful and failed orders:
+
+```bash
+chmod +x demo.sh
+./demo.sh
+```
+
+The demo:
+1. Creates a successful order and processes it through all workers
+2. Creates a failing order (amount 999.99) and shows payment failure
+3. Demonstrates idempotency (duplicate events processed once)
+4. Verifies order status transitions
 
 ## Development Notes
 
