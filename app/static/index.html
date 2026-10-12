@@ -370,6 +370,14 @@
             document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
             document.getElementById(tab).classList.add('active');
             event.target.classList.add('active');
+            
+            // Auto-populate Order ID field if switching to Track tab and we have a last order ID
+            if (tab === 'track') {
+                const lastOrderId = sessionStorage.getItem('lastOrderId');
+                if (lastOrderId) {
+                    document.getElementById('orderId').value = lastOrderId;
+                }
+            }
         }
 
         function addItem() {
@@ -393,26 +401,41 @@
             e.preventDefault();
             
             const items = [];
+            let totalAmount = 0;
+            
             document.querySelectorAll('.item-row').forEach(row => {
                 const name = row.querySelector('.item-name').value;
-                const quantity = parseInt(row.querySelector('.item-quantity').value);
-                const price = row.querySelector('.item-price').value;
-                if (name && quantity && price) {
-                    items.push({ name, quantity, price });
+                const quantityStr = row.querySelector('.item-quantity').value;
+                const priceStr = row.querySelector('.item-price').value;
+                
+                if (name && quantityStr && priceStr) {
+                    const quantity = parseInt(quantityStr);
+                    const price = parseFloat(priceStr);
+                    
+                    if (quantity > 0 && price > 0) {
+                        // Format price to 2 decimal places for API
+                        const formattedPrice = price.toFixed(2);
+                        items.push({ name, quantity, price: formattedPrice });
+                        totalAmount += price * quantity;
+                    }
                 }
             });
 
             if (items.length === 0) {
-                showResult('createResult', 'At least one item is required', 'error');
+                showResult('createResult', 'At least one item with valid quantity and price is required', 'error');
                 return;
             }
+
+            // Format total to 2 decimal places
+            const totalAmountStr = totalAmount.toFixed(2);
 
             const orderData = {
                 customer_name: document.getElementById('customerName').value,
                 customer_email: document.getElementById('customerEmail').value,
                 customer_phone: document.getElementById('customerPhone').value,
                 delivery_address: document.getElementById('deliveryAddress').value,
-                items: items
+                items: items,
+                total_amount: totalAmountStr
             };
 
             showLoading('createLoading', true);
@@ -426,19 +449,36 @@
                 const data = await response.json();
 
                 if (response.ok) {
+                    // Store order ID in sessionStorage so Track Order tab can use it
+                    sessionStorage.setItem('lastOrderId', data.id);
+                    
                     const html = `
                         <div class="result-box success">
                             <h3>✓ Order Created Successfully!</h3>
-                            <p><strong>Order ID:</strong><br>${data.id}</p>
-                            <p><strong>Status:</strong> ${data.status}</p>
+                            <p><strong>Order ID:</strong><br><code style="background: #f0f0f0; padding: 8px; display: block; border-radius: 4px; margin-top: 5px;">${data.id}</code></p>
+                            <p><strong>Status:</strong> <span class="status-badge status-${data.status.toLowerCase()}">${data.status}</span></p>
                             <p><strong>Total:</strong> $${data.total_amount}</p>
-                            <p style="font-size: 12px; margin-top: 10px; opacity: 0.7;">Save the Order ID to track your order status.</p>
+                            <p style="font-size: 12px; margin-top: 10px; opacity: 0.7;">✓ Order ID copied to Track tab. Go to Track Order to check status.</p>
                         </div>
                     `;
                     showResult('createResult', html, 'success');
                     document.getElementById('orderForm').reset();
                 } else {
-                    showResult('createResult', data.detail || 'Error creating order', 'error');
+                    // Handle validation errors from Pydantic
+                    let errorMsg = 'Error creating order';
+                    if (data.detail) {
+                        if (Array.isArray(data.detail)) {
+                            // Pydantic validation error format
+                            errorMsg = data.detail.map(err => {
+                                const field = err.loc[err.loc.length - 1];
+                                const msg = err.msg;
+                                return `${field}: ${msg}`;
+                            }).join('<br>');
+                        } else if (typeof data.detail === 'string') {
+                            errorMsg = data.detail;
+                        }
+                    }
+                    showResult('createResult', errorMsg, 'error');
                 }
             } catch (err) {
                 showResult('createResult', 'Network error: ' + err.message, 'error');
@@ -451,6 +491,11 @@
             e.preventDefault();
             const orderId = document.getElementById('orderId').value;
 
+            if (!orderId) {
+                showResult('trackResult', 'Please enter an Order ID', 'error');
+                return;
+            }
+
             showLoading('trackLoading', true);
             try {
                 const response = await fetch(`${API_URL}/orders/${orderId}`);
@@ -461,7 +506,7 @@
                     const html = `
                         <div class="result-box success">
                             <h3>Order Details</h3>
-                            <p><strong>Order ID:</strong><br>${data.id}</p>
+                            <p><strong>Order ID:</strong><br><code style="background: #f0f0f0; padding: 8px; display: block; border-radius: 4px; margin-top: 5px;">${data.id}</code></p>
                             <p><strong>Customer:</strong> ${data.customer_name}</p>
                             <p><strong>Status:</strong><span class="status-badge ${statusClass}">${data.status}</span></p>
                             <p><strong>Total:</strong> $${data.total_amount}</p>
@@ -471,7 +516,13 @@
                     `;
                     showResult('trackResult', html, 'success');
                 } else {
-                    showResult('trackResult', data.detail || 'Order not found', 'error');
+                    let errorMsg = data.detail || 'Order not found';
+                    if (typeof errorMsg === 'string' && errorMsg.startsWith('Order')) {
+                        // Already formatted
+                    } else if (Array.isArray(data.detail)) {
+                        errorMsg = 'Invalid Order ID format';
+                    }
+                    showResult('trackResult', errorMsg, 'error');
                 }
             } catch (err) {
                 showResult('trackResult', 'Network error: ' + err.message, 'error');
