@@ -1,14 +1,17 @@
 """FastAPI routes for QuickBite orders API."""
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
 from uuid import UUID
 
+import aio_pika
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_session
 from app.models import Order, OrderStatus, OutboxEvent
 from app.schemas import CreateOrderRequest, HealthResponse, OrderResponse
@@ -16,9 +19,35 @@ from app.schemas import CreateOrderRequest, HealthResponse, OrderResponse
 router = APIRouter()
 
 
+async def _check_rabbitmq(timeout_seconds: float = 3.0) -> str:
+    """Verify RabbitMQ is reachable via an AMQP handshake.
+
+    Scope: TCP + AMQP handshake + authentication only. It does not verify
+    queue depths, consumer counts, or topology. A separate operational
+    check (management API / rabbitmq-diagnostics) covers those.
+    """
+    rabbitmq_url = (
+        f"amqp://{settings.rabbitmq_user}:{settings.rabbitmq_password}"
+        f"@{settings.rabbitmq_host}:{settings.rabbitmq_port}/{settings.rabbitmq_vhost}"
+    )
+    try:
+        connection = await asyncio.wait_for(
+            aio_pika.connect_robust(rabbitmq_url), timeout=timeout_seconds
+        )
+        await connection.close()
+        return "healthy"
+    except Exception as e:
+        return f"unhealthy: {str(e)[:80]}"
+
+
 @router.get("/health", response_model=HealthResponse, tags=["health"])
-def health_check(session: Session = Depends(get_session)):
-    """Health check endpoint that verifies database connectivity."""
+async def health_check(session: Session = Depends(get_session)):
+    """Health check endpoint verifying database and RabbitMQ connectivity.
+
+    Returns overall ``status`` = "ok" when every dependency is healthy,
+    otherwise "degraded" (HTTP 200 in both cases; per-dependency fields
+    carry the detail). Scope: DB ping + AMQP handshake only.
+    """
     try:
         # Simple query to verify database connectivity
         result = session.execute(select(1))
@@ -27,9 +56,18 @@ def health_check(session: Session = Depends(get_session)):
     except Exception as e:
         db_status = f"unhealthy: {str(e)[:50]}"
 
+    rabbit_status = await _check_rabbitmq()
+
+    overall = (
+        "ok"
+        if db_status == "healthy" and rabbit_status == "healthy"
+        else "degraded"
+    )
+
     return HealthResponse(
-        status="ok",
+        status=overall,
         database=db_status,
+        rabbitmq=rabbit_status,
         version="0.1.0",
         timestamp=datetime.utcnow(),
     )

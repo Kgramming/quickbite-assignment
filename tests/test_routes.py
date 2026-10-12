@@ -4,15 +4,41 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-def test_health_check(client: TestClient):
-    """Test health check endpoint."""
+def test_health_check_broker_down(client: TestClient, monkeypatch):
+    """Health is 'degraded' when RabbitMQ is unreachable (mocked).
+
+    Mocked so the test is deterministic regardless of whether a broker
+    happens to be running in the test environment.
+    """
+    import app.routes as routes_module
+
+    async def fake_rabbitmq_check(timeout_seconds: float = 3.0) -> str:
+        return "unhealthy: mocked connection refused"
+
+    monkeypatch.setattr(routes_module, "_check_rabbitmq", fake_rabbitmq_check)
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "degraded"
+    assert data["database"] == "healthy"
+    assert data["rabbitmq"].startswith("unhealthy")
+    assert data["version"] == "0.1.0"
+    assert "timestamp" in data
+
+
+def test_health_check_all_healthy(client: TestClient, monkeypatch):
+    """Health is 'ok' when every dependency reports healthy (mocked)."""
+    import app.routes as routes_module
+
+    async def fake_rabbitmq_check(timeout_seconds: float = 3.0) -> str:
+        return "healthy"
+
+    monkeypatch.setattr(routes_module, "_check_rabbitmq", fake_rabbitmq_check)
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert "database" in data
-    assert data["version"] == "0.1.0"
-    assert "timestamp" in data
+    assert data["rabbitmq"] == "healthy"
 
 
 def test_create_order_success(client: TestClient):

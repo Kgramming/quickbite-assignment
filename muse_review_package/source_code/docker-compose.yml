@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:16-alpine
+    container_name: quickbite-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: quickbite_user
+      POSTGRES_PASSWORD: quickbite_password
+      POSTGRES_DB: quickbite_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - quickbite-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quickbite_user -d quickbite_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  # RabbitMQ message broker with durable exchange and queues
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: quickbite-rabbitmq
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: quickbite
+      RABBITMQ_DEFAULT_PASS: quickbite_password
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - quickbite-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+volumes:
+  quickbite-postgres-data:
+    driver: local
+  quickbite-rabbitmq-data:
+    driver: local
+
+networks:
+  quickbite-net:
+    driver: bridge
+    name: quickbite-net

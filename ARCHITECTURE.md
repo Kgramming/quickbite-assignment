@@ -22,24 +22,24 @@ QuickBite is a distributed food delivery backend implementing the outbox pattern
 │  ┌──────────────────────────────────────┐    ┌─────────────────────┐│
 │  │      PostgreSQL Database             │    │  RabbitMQ (Phase 2) ││
 │  ├──────────────────────────────────────┤    ├─────────────────────┤│
-│  │ Table: orders                        │    │ Exchange: quickbite ││
-│  │  - id (UUID, PK)                     │    │ .orders (topic)     ││
-│  │  - customer_* (name, email, phone)   │    │                     ││
-│  │  - delivery_address                  │    │ Queues:             ││
-│  │  - items (JSON)                      │    │ - payment.queue     ││
-│  │  - status (ENUM)                     │    │ - restaurant.queue  ││
-│  │  - total_amount                      │    │ - delivery.queue    ││
-│  │  - payment_status                    │    │ - notification.q    ││
-│  │  - created/updated_at                │    │ - orders.dlq        ││
-│  │                                      │    │                     ││
-│  │ Table: outbox_events                 │    │ Topics:             ││
-│  │  - id (UUID, PK)                     │    │ - order.created     ││
-│  │  - event_type                        │    │ - order.paid        ││
-│  │  - order_id (FK)                     │    │ - order.confirmed   ││
-│  │  - payload (JSON)                    │    │ - order.assigned    ││
-│  │  - published (Y/N)                   │    │ - order.failed      ││
-│  │  - published_at                      │    │                     ││
-│  │  - created_at                        │    └─────────────────────┘│
+│  │ Table: orders                        │    │ Exchange: quickbite    ││
+│  │  - id (UUID, PK)                     │    │ .orders (topic)        ││
+│  │  - customer_* (name, email, phone)   │    │                        ││
+│  │  - delivery_address                  │    │ Queues:                ││
+│  │  - items (JSON)                      │    │ - payment.queue        ││
+│  │  - status (ENUM)                     │    │ - restaurant.queue     ││
+│  │  - total_amount                      │    │ - delivery.queue       ││
+│  │  - payment_status                    │    │ - notification.queue   ││
+│  │  - created/updated_at                │    │ - orders.dlq           ││
+│  │                                      │    │                        ││
+│  │ Table: outbox_events                 │    │ Topics:                ││
+│  │  - id (UUID, PK)                     │    │ - order.created        ││
+│  │  - event_type                        │    │ - order.paid           ││
+│  │  - order_id (FK)                     │    │ - order.confirmed      ││
+│  │  - payload (JSON)                    │    │ - order.driver.assigned││
+│  │  - published (Y/N)                   │    │ - order.payment.failed ││
+│  │  - published_at                      │    │                        ││
+│  │  - created_at                        │    └────────────────────────┘│
 │  └──────────────────────────────────────┘                          │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -51,7 +51,7 @@ Phase 2 (Workers) - Independent Consumers
 │  payment.queue)  │ restaurant.q)    │  delivery.q)    │ notification.q)  │
 │                  │                  │                 │                  │
 │ Subscribes to:   │ Subscribes to:   │ Subscribes to:  │ Subscribes to:   │
-│ - order.created  │ - order.paid     │ - order.confirm │ - order.*        │
+│ - order.created  │ - order.paid     │ - order.confirmed│ - order.*        │
 │                  │                  │                 │                  │
 │ Updates order:   │ Updates order:   │ Updates order:  │ Logs events,     │
 │ PENDING -> PAID  │ PAID -> CONFIRMED│ CONFIRMED ->    │ sends emails/SMS │
@@ -190,18 +190,26 @@ Notification Worker
 
 ## RabbitMQ Configuration Details
 
-### Exchange
-- **Name**: `quickbite.orders`
-- **Type**: Topic
-- **Durable**: Yes (survives broker restart)
-- **Auto-delete**: No
+### Exchanges (All Durable)
+- **quickbite.orders** (topic): business events.
+- **quickbite.retry** (fanout): delayed retries. Workers publish failed
+  messages here with a per-message TTL; `orders.retry.queue` dead-letters
+  them back to `quickbite.orders` with their original routing key.
+- **dlx.quickbite.orders** (topic): dead-letter exchange.
 
 ### Queues (All Durable)
-- **payment.queue**: `order.created` → triggers payment processing
-- **restaurant.queue**: `order.paid` → triggers restaurant confirmation
-- **delivery.queue**: `order.confirmed` → triggers driver assignment
-- **notification.queue**: `order.*` → receives all order events
-- **orders.dead-letter.queue**: Receives messages rejected by other queues after max retries
+- **payment.queue** ← `order.created` → triggers payment processing
+- **restaurant.queue** ← `order.paid` → triggers restaurant confirmation
+- **delivery.queue** ← `order.confirmed` → triggers driver assignment
+- **notification.queue** ← `order.#` → receives all order events
+- **orders.retry.queue**: holds retry copies until their TTL expires;
+  `x-dead-letter-exchange = quickbite.orders` (no plugins required).
+- **orders.dead-letter.queue** ← `#` on `dlx.quickbite.orders`:
+  receives messages rejected after max retries (or poison messages),
+  with their original routing key preserved.
+
+Every worker queue declares `x-dead-letter-exchange: dlx.quickbite.orders`,
+so a rejected message can never be silently dropped.
 
 ### Message Flow
 ```
@@ -211,7 +219,7 @@ order.created (event_type="order.created")
           └─ Routes to restaurant.queue → Restaurant Worker
              └─ On success: Publishes event_type="order.confirmed"
                 └─ Routes to delivery.queue → Delivery Worker
-                   └─ On success: Publishes event_type="order.assigned"
+                   └─ On success: Publishes event_type="order.driver.assigned"
 
 order.paid (event_type="order.paid")
     └─ Routes to restaurant.queue AND notification.queue
@@ -219,13 +227,37 @@ order.paid (event_type="order.paid")
 order.confirmed (event_type="order.confirmed")
     └─ Routes to delivery.queue AND notification.queue
 
-order.assigned (event_type="order.assigned")
+order.driver.assigned (event_type="order.driver.assigned")
     └─ Routes to notification.queue
 
-order.failed (event_type="order.failed")
+order.payment.failed (event_type="order.payment.failed")
     └─ If payment fails: Published by Payment Worker
     └─ Routes to notification.queue (notifies customer of failure)
 ```
+
+### Reliability Mechanics
+- **Publisher confirms**: enabled on every connection
+  (`connect_robust(..., publisher_confirms=True)`). The outbox publisher
+  marks a row `published='Y'` only after the broker confirms receipt;
+  a `basic.nack` raises and the row stays `'N'` for the next poll.
+- **Manual acknowledgements**: workers never use
+  `message.process()`; `settle_message()` acks only after the worker's
+  database transaction (idempotency claim + state transition + outbox
+  row) has committed — or, on the retry path, after the broker confirms
+  the retry copy.
+- **Bounded retries**: `x-retry-count` header, max 3 attempts, backoff
+  5s → 10s → 20s via per-message TTL on the retry loop. Exhaustion (or
+  a poison message) → `reject(requeue=False)` → DLX →
+  `orders.dead-letter.queue`, and the order is marked `FAILED`
+  (never overwriting a terminal state).
+- **Idempotency**: `claim_event()` performs a single atomic
+  `INSERT ... ON CONFLICT DO NOTHING` on
+  `processed_events(event_id, worker_type)` inside the worker's
+  transaction — safe across redeliveries and concurrent worker
+  instances.
+- **Isolation**: each worker runs on its own AMQP channel with
+  `prefetch_count=1`, so a channel error in one consumer cannot take
+  down the others and prefetch is per worker, not shared.
 
 ## Failure Scenarios & Handling
 
@@ -262,7 +294,7 @@ order.failed (event_type="order.failed")
 6. Idempotency check: order status is already PAID, so no duplicate charge
 7. Acknowledges message
 
-**Guarantee**: Message is not lost; duplicate processing is prevented by idempotency checks.
+**Guarantee**: Message is not lost; duplicate processing is prevented by the atomic idempotency claim (`INSERT ... ON CONFLICT DO NOTHING`).
 
 ### Scenario 4: RabbitMQ Connection Fails
 
@@ -284,6 +316,23 @@ order.failed (event_type="order.failed")
 4. Operator reviews and decides to discard or retry
 
 **Guarantee**: Bad messages don't block the queue indefinitely.
+
+### Scenario 6: Transient Failure Exhausts Retries
+
+**What Happens**:
+1. Worker hits a transient error (e.g. database blip) processing a message
+2. `x-retry-count` (0, 1, 2) < max (3): publishes a retry copy to the
+   `quickbite.retry` exchange with TTL backoff (5s → 10s → 20s) and acks
+   the original only after the broker confirms the copy
+3. Each expiry redelivers the message to the originating worker queue
+4. On the 4th failure the worker marks the order `FAILED` (unless already
+   terminal) and rejects with `requeue=False`
+5. The queue's `x-dead-letter-exchange` routes it to
+   `orders.dead-letter.queue` with the original routing key preserved
+
+**Guarantee**: Bounded retries (no infinite redelivery loops); every
+exhausted message is inspectable in the DLQ; the order reflects the
+failure.
 
 ## Performance Characteristics
 

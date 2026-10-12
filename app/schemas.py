@@ -51,5 +51,6 @@ class HealthResponse(BaseModel):
 
     status: str
     database: str
+    rabbitmq: str
     version: str
     timestamp: datetime

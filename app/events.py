@@ -9,15 +9,19 @@ from pydantic import BaseModel, Field
 
 
 class EventType(str, Enum):
-    """Types of order events."""
+    """Types of order events.
+
+    Values are the AMQP routing keys used on the ``quickbite.orders``
+    topic exchange, aligned with the assignment specification.
+    """
 
     ORDER_CREATED = "order.created"
-    PAYMENT_INITIATED = "order.payment_initiated"
-    PAYMENT_SUCCESS = "order.payment_success"
-    PAYMENT_FAILED = "order.payment_failed"
-    RESTAURANT_CONFIRMED = "order.restaurant_confirmed"
-    DELIVERY_ASSIGNED = "order.delivery_assigned"
-    NOTIFICATION_SENT = "order.notification_sent"
+    PAYMENT_INITIATED = "order.payment.initiated"
+    PAYMENT_SUCCESS = "order.paid"
+    PAYMENT_FAILED = "order.payment.failed"
+    RESTAURANT_CONFIRMED = "order.confirmed"
+    DELIVERY_ASSIGNED = "order.driver.assigned"
+    NOTIFICATION_SENT = "order.notification.sent"
 
 
 class BusinessEvent(BaseModel):
@@ -108,30 +112,45 @@ class NotificationSentEvent(BusinessEvent):
     )
 
 
-# Routing key mapping for RabbitMQ topic exchange
+# Routing key mapping for RabbitMQ topic exchange.
+# Keys follow the assignment specification exactly:
+#   order.created, order.paid, order.payment.failed,
+#   order.confirmed, order.driver.assigned
 EVENT_ROUTING_KEYS = {
     EventType.ORDER_CREATED: "order.created",
     EventType.PAYMENT_INITIATED: "order.payment.initiated",
-    EventType.PAYMENT_SUCCESS: "order.payment.success",
+    EventType.PAYMENT_SUCCESS: "order.paid",
     EventType.PAYMENT_FAILED: "order.payment.failed",
-    EventType.RESTAURANT_CONFIRMED: "order.restaurant.confirmed",
-    EventType.DELIVERY_ASSIGNED: "order.delivery.assigned",
+    EventType.RESTAURANT_CONFIRMED: "order.confirmed",
+    EventType.DELIVERY_ASSIGNED: "order.driver.assigned",
     EventType.NOTIFICATION_SENT: "order.notification.sent",
 }
 
 
-# Queue configuration mapping
+# Queue configuration mapping: queue name -> routing keys bound on quickbite.orders
 QUEUE_CONFIG = {
     "payment.queue": [
         "order.created",
     ],
     "restaurant.queue": [
-        "order.payment.success",
+        "order.paid",
     ],
     "delivery.queue": [
-        "order.restaurant.confirmed",
+        "order.confirmed",
     ],
     "notification.queue": [
         "order.#",  # Listen to all order events
     ],
+}
+
+
+# Mapping from outbox_events.event_type (stored string) to AMQP routing key.
+# Workers store the dotted spec form directly, so this is an explicit
+# allow-list: unknown event types are never published silently.
+OUTBOX_ROUTING_KEYS = {
+    "order.created": "order.created",
+    "order.paid": "order.paid",
+    "order.payment.failed": "order.payment.failed",
+    "order.confirmed": "order.confirmed",
+    "order.driver.assigned": "order.driver.assigned",
 }

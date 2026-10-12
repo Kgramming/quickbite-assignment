@@ -23,6 +23,7 @@ class OrderStatus(str, Enum):
     DRIVER_ASSIGNED = "DRIVER_ASSIGNED"
     PAYMENT_FAILED = "PAYMENT_FAILED"
     CANCELLED = "CANCELLED"
+    FAILED = "FAILED"  # Message exhausted retries / dead-lettered
 
 
 class Order(Base):

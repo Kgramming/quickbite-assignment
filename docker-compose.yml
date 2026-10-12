@@ -49,6 +49,129 @@ services:
     networks:
       - quickbite-net
 
+  # QuickBite API (FastAPI)
+  api:
+    build: .
+    container_name: quickbite-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002
+    ports:
+      - "127.0.0.1:8002:8002"
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  # Outbox publisher: relays outbox_events rows to RabbitMQ
+  publisher:
+    build: .
+    container_name: quickbite-publisher
+    command: python -m app.outbox_publisher
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  # Four independent worker consumers, one service each.
+  # Scale any single worker type, e.g.:
+  #   docker compose up -d --scale worker-payment=3
+  worker-payment:
+    build: .
+    command: python -m app.worker_service --workers payment
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  worker-restaurant:
+    build: .
+    command: python -m app.worker_service --workers restaurant
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  worker-delivery:
+    build: .
+    command: python -m app.worker_service --workers delivery
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
+  worker-notification:
+    build: .
+    command: python -m app.worker_service --workers notification
+    environment:
+      DATABASE_URL: postgresql+psycopg://quickbite_user:quickbite_password@postgres:5432/quickbite_db
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: quickbite
+      RABBITMQ_PASSWORD: quickbite_password
+      RABBITMQ_VHOST: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - quickbite-net
+
 volumes:
   quickbite-postgres-data:
     driver: local

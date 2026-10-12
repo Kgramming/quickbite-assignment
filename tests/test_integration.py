@@ -132,7 +132,7 @@ class TestOrderFlow:
         # Verify outbox event created for payment.success
         outbox = integration_db.query(OutboxEvent).filter(
             OutboxEvent.order_id == "test-order-1",
-            OutboxEvent.event_type == "order.payment_success",
+            OutboxEvent.event_type == "order.paid",
         ).first()
         assert outbox is not None
 
@@ -175,7 +175,7 @@ class TestOrderFlow:
         # Verify NO payment.success event was created
         success_events = integration_db.query(OutboxEvent).filter(
             OutboxEvent.order_id == "test-order-fail",
-            OutboxEvent.event_type == "order.payment_success",
+            OutboxEvent.event_type == "order.paid",
         ).all()
         assert len(success_events) == 0
 
@@ -214,7 +214,7 @@ class TestOrderFlow:
         # Verify restaurant.confirmed event created
         outbox = integration_db.query(OutboxEvent).filter(
             OutboxEvent.order_id == "test-order-rest",
-            OutboxEvent.event_type == "order.restaurant_confirmed",
+            OutboxEvent.event_type == "order.confirmed",
         ).first()
         assert outbox is not None
 
@@ -253,7 +253,7 @@ class TestOrderFlow:
         # Verify delivery.assigned event created
         outbox = integration_db.query(OutboxEvent).filter(
             OutboxEvent.order_id == "test-order-deliv",
-            OutboxEvent.event_type == "order.delivery_assigned",
+            OutboxEvent.event_type == "order.driver.assigned",
         ).first()
         assert outbox is not None
 
@@ -302,7 +302,7 @@ class TestIdempotency:
         # Verify only one payment.success event
         success_events = integration_db.query(OutboxEvent).filter(
             OutboxEvent.order_id == "test-order-dup",
-            OutboxEvent.event_type == "order.payment_success",
+            OutboxEvent.event_type == "order.paid",
         ).all()
         assert len(success_events) == 1
 

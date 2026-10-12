@@ -20,8 +20,8 @@ PENDING → PAID → CONFIRMED → DRIVER_ASSIGNED
 
 ### Failure Handling
 - **Payment Failure**: Order status transitions to `PAYMENT_FAILED` and does not progress
-- **Retry Logic**: Dead-letter queue captures poison pills; configurable retry behavior
-- **Idempotency**: All consumers implement idempotent processing with state checks
+- **Retry Logic**: Bounded retries (max 3, 5s/10s/20s TTL backoff via the `quickbite.retry` loop); exhausted or poison messages are rejected to `orders.dead-letter.queue` and the order is marked `FAILED`
+- **Idempotency**: Atomic `INSERT ... ON CONFLICT DO NOTHING` claim per event/worker — safe across redeliveries and concurrent worker instances
 
 ### Outbox Pattern
 The system implements the outbox pattern to guarantee at-least-once delivery of events:
@@ -60,20 +60,24 @@ This design ensures:
    pip install -r requirements.txt
    ```
 
-4. **Start Docker containers** (PostgreSQL + RabbitMQ)
+4. **Start the stack** — either fully containerized:
    ```bash
-   docker-compose up -d
+   docker compose up -d
+   # Services: postgres, rabbitmq, api, publisher,
+   #           worker-payment, worker-restaurant, worker-delivery, worker-notification
+   ```
+   or infrastructure-only, then run Python processes manually:
+   ```bash
+   docker compose up -d postgres rabbitmq
+   python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8002   # terminal 1
+   python3 -m app.outbox_publisher                                 # terminal 2
+   python3 -m app.worker_service                                  # terminal 3
    ```
 
 5. **Wait for services to be healthy**
    ```bash
-   docker-compose ps
-   # Wait until both postgres and rabbitmq show "healthy"
-   ```
-
-6. **Run the FastAPI server**
-   ```bash
-   python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8002
+   docker compose ps
+   # Wait until postgres and rabbitmq show "healthy"
    ```
 
 The API will be available at `http://127.0.0.1:8002`
@@ -110,10 +114,14 @@ Response:
 {
   "status": "ok",
   "database": "healthy",
+  "rabbitmq": "healthy",
   "version": "0.1.0",
   "timestamp": "2024-10-12T14:30:00"
 }
 ```
+`status` is `"ok"` only when every dependency is healthy, otherwise
+`"degraded"`. Scope: database ping + AMQP handshake (it does not check
+queue depths — use the RabbitMQ management UI for that).
 
 ### Create Order
 ```bash
@@ -208,18 +216,36 @@ quickbite-assignment/
 │   ├── database.py          # SQLAlchemy setup, session management
 │   ├── models.py            # Order, OutboxEvent models
 │   ├── schemas.py           # Pydantic request/response schemas
-│   └── routes.py            # API endpoints
+│   ├── routes.py            # API endpoints
+│   ├── events.py            # Event types, routing keys, queue config
+│   ├── rabbitmq.py          # Connection, topology, DLX, retry loop
+│   ├── retry.py             # Bounded-retry policy (max 3, TTL backoff)
+│   ├── worker_common.py     # Shared ack/settlement + DLQ helpers
+│   ├── idempotency.py       # Atomic processed_events claim
+│   ├── outbox_publisher.py  # Outbox -> RabbitMQ relay (confirms)
+│   ├── worker_service.py    # Worker runner (--workers subset flag)
+│   └── workers/             # payment, restaurant, delivery, notification
 ├── tests/
-│   ├── __init__.py
-│   ├── conftest.py          # Pytest fixtures
-│   ├── test_schemas.py      # Schema validation tests
-│   ├── test_routes.py       # API endpoint tests
-│   └── test_models.py       # Model tests
-├── docker-compose.yml       # PostgreSQL + RabbitMQ services
+│   ├── conftest.py              # Pytest fixtures (SQLite)
+│   ├── test_routes.py           # API endpoint tests
+│   ├── test_models.py           # Model tests
+│   ├── test_schemas.py          # Schema validation tests
+│   ├── test_integration.py      # Worker logic vs SQLite (direct calls)
+│   ├── test_reliability.py      # Reliability mechanisms (mocked broker)
+│   └── test_integration_live.py # Real Postgres+RabbitMQ (marked live)
+├── docs/
+│   ├── REQUIREMENTS_CHECKLIST.md
+│   ├── TESTING.md
+│   └── migrations/          # SQL migrations for existing databases
+├── docker-compose.yml       # postgres, rabbitmq, api, publisher, 4 workers
+├── Dockerfile               # Worker/API image
+├── demo.sh                  # End-to-end demo checklist
 ├── requirements.txt         # Python dependencies
-├── .env                     # Environment variables (git-ignored in .gitignore)
 ├── .env.example             # Example environment template
 ├── pytest.ini               # Pytest configuration
+├── ARCHITECTURE.md          # Architecture + reliability design
+├── TECHNICAL_REPORT.md      # Technical report + fixes addendum
+├── CHANGELOG.md             # Change history
 └── README.md                # This file
 ```
 
@@ -230,11 +256,16 @@ The following RabbitMQ resources will be created by the outbox publisher and wor
 | Resource | Type | Durable | Notes |
 |----------|------|---------|-------|
 | `quickbite.orders` | Topic Exchange | Yes | Main exchange for order events |
-| `payment.queue` | Queue | Yes | Payment processing |
-| `restaurant.queue` | Queue | Yes | Restaurant confirmation |
-| `delivery.queue` | Queue | Yes | Delivery assignment |
-| `notification.queue` | Queue | Yes | Notifications (email, SMS) |
-| `orders.dead-letter.queue` | Queue | Yes | Poison pills and failures |
+| `quickbite.retry` | Fanout Exchange | Yes | Delayed retries (per-message TTL) |
+| `dlx.quickbite.orders` | Topic Exchange | Yes | Dead-letter exchange |
+| `payment.queue` | Queue | Yes | `order.created` → payment processing |
+| `restaurant.queue` | Queue | Yes | `order.paid` → restaurant confirmation |
+| `delivery.queue` | Queue | Yes | `order.confirmed` → delivery assignment |
+| `notification.queue` | Queue | Yes | `order.#` → notifications (email, SMS) |
+| `orders.retry.queue` | Queue | Yes | TTL wait; dead-letters back to `quickbite.orders` |
+| `orders.dead-letter.queue` | Queue | Yes | Rejected/poison messages, original routing key kept |
+
+Every worker queue declares `x-dead-letter-exchange: dlx.quickbite.orders`.
 
 ## Docker Management
 
@@ -284,20 +315,22 @@ Phase 2 implements reliable asynchronous messaging with four independent worker 
 In separate terminal windows:
 
 ```bash
-# Terminal 2: Start outbox publisher
+# Terminal 2: Start outbox publisher (DB outbox -> RabbitMQ relay)
 python3 -m app.outbox_publisher
 
-# Terminal 3: Start payment worker
-python3 -m app.worker_service payment
+# Terminal 3: Start all four workers (each on its own AMQP channel)
+python3 -m app.worker_service
 
-# Terminal 4: Start restaurant worker
-python3 -m app.worker_service restaurant
+# Or run a subset (e.g. for the notification-downtime demo):
+python3 -m app.worker_service --workers payment,restaurant,delivery
+```
 
-# Terminal 5: Start delivery worker
-python3 -m app.worker_service delivery
+Or run the whole stack containerized (API + publisher + workers):
 
-# Terminal 6: Start notification worker
-python3 -m app.worker_service notification
+```bash
+docker compose up -d
+# Scale workers to 3 instances:
+docker compose up -d --scale worker-payment=3
 ```
 
 ### Order Status Flow
@@ -327,17 +360,21 @@ python3 -m app.worker_service notification
 
 - **Durable Queues**: Messages survive broker restarts
 - **Persistent Messages**: PERSISTENT delivery mode
-- **Publisher Confirms**: Outbox events marked published only after broker ACK
-- **Idempotent Consumers**: Database prevents duplicate processing
-- **Manual Acknowledgements**: Workers acknowledge only after database commit
-- **Dead-Letter Queue**: Failed messages go to `orders.dead-letter.queue`
+- **Publisher Confirms**: Explicitly enabled; outbox events marked published only after broker ACK
+- **Idempotent Consumers**: Atomic `INSERT ... ON CONFLICT DO NOTHING` claim per event/worker — safe across redeliveries and concurrent instances
+- **Manual Acknowledgements**: Workers ack only after the DB transaction commits (or after the broker confirms the retry copy); no `message.process()` double-settlement
+- **Bounded Retries**: Max 3 attempts, 5s → 10s → 20s TTL backoff via the `quickbite.retry` loop — no infinite redelivery
+- **Dead-Letter Queue**: `dlx.quickbite.orders` + per-queue `x-dead-letter-exchange`; exhausted/poison messages land in `orders.dead-letter.queue` and the order is marked `FAILED`
 - **State Machine Enforcement**: Workers check current status before transitioning
+- **Per-worker Channels**: Each consumer gets its own channel with `prefetch_count=1`
 
 ### Testing Phase 2
 
 ```bash
-# Run all 27 tests (17 Phase 1 + 10 Phase 2)
+# Unit + mocked-reliability + SQLite integration tests
 pytest tests/ -v
+# Live broker/Postgres tests (needs: docker compose up -d postgres rabbitmq)
+QUICKBITE_RUN_LIVE=1 pytest -m live -v
 
 # Run only Phase 2 integration tests
 pytest tests/test_integration.py -v

@@ -12,8 +12,8 @@ Phase 2 implements reliable asynchronous messaging with a durable RabbitMQ topol
 - Durable topic exchange `quickbite.orders`
 - Four durable queues with proper bindings:
   - `payment.queue` → `order.created`
-  - `restaurant.queue` → `order.payment_success`
-  - `delivery.queue` → `order.restaurant_confirmed`
+  - `restaurant.queue` → `order.paid`
+  - `delivery.queue` → `order.confirmed`
   - `notification.queue` → `order.#` (all order events)
 - Dead-letter queue: `orders.dead-letter.queue`
 - QoS prefetch_count=1 for fair distribution
@@ -38,22 +38,22 @@ Phase 2 implements reliable asynchronous messaging with a durable RabbitMQ topol
 - Subscribes to `payment.queue` (order.created events)
 - Validates order is PENDING before processing
 - Mock payment processor (fails if amount == 999.99)
-- Creates `order.payment_success` or `order.payment_failed` events
+- Creates `order.paid` or `order.payment.failed` events
 - Transitions order: PENDING → PAID or PAYMENT_FAILED
 - Records idempotency entry; prevents duplicate charges
 
 **Restaurant Worker** (`app/workers/restaurant.py`):
-- Subscribes to `restaurant.queue` (order.payment_success events)
+- Subscribes to `restaurant.queue` (order.paid events)
 - Validates order is PAID (enforces state machine)
 - Simulates restaurant confirmation
-- Creates `order.restaurant_confirmed` event
+- Creates `order.confirmed` event
 - Transitions order: PAID → CONFIRMED
 
 **Delivery Worker** (`app/workers/delivery.py`):
-- Subscribes to `delivery.queue` (order.restaurant_confirmed events)
+- Subscribes to `delivery.queue` (order.confirmed events)
 - Validates order is CONFIRMED (enforces state machine)
 - Simulates driver assignment
-- Creates `order.delivery_assigned` event
+- Creates `order.driver.assigned` event
 - Transitions order: CONFIRMED → DRIVER_ASSIGNED
 
 **Notification Worker** (`app/workers/notification.py`):
@@ -502,3 +502,97 @@ Phase 1 successfully delivers:
 - ✅ Foundation for Phase 2 workers and messaging
 
 The system is ready for Phase 2 implementation of workers and asynchronous event processing.
+
+---
+
+## Addendum — Reliability Fixes (2026-10-12)
+
+An independent review of the repository identified five blocking (P0)
+and several P1 issues. The fixes below were implemented against the
+reviewed baseline without changing the overall architecture.
+
+### P0 fixes
+
+1. **`RabbitMQManager.connect()` now returns the manager.**
+   Previously it returned `None`, so `python -m app.worker_service`
+   and `python -m app.outbox_publisher` crashed with `AttributeError`
+   on startup. Both entrypoints now initialize correctly
+   (`app/rabbitmq.py`, `app/worker_service.py`,
+   `app/outbox_publisher.py`).
+
+2. **Bounded retries + working dead-letter routing.**
+   - New `quickbite.retry` fanout exchange + `orders.retry.queue`
+     (per-message TTL, `x-dead-letter-exchange: quickbite.orders`):
+     transient failures retry at most 3 times with 5s → 10s → 20s
+     backoff, no broker plugins required (`app/retry.py`).
+   - New `dlx.quickbite.orders` topic exchange; every worker queue
+     declares `x-dead-letter-exchange`, and
+     `orders.dead-letter.queue` is bound with `#`, so rejected
+     messages actually arrive in the DLQ with their original routing
+     key. Previously the DLQ was declared with no bindings and nothing
+     could ever dead-letter.
+   - On exhaustion the worker marks the order `FAILED` (new
+     `OrderStatus.FAILED`; terminal states are never overwritten).
+
+3. **Routing keys aligned with the assignment specification.**
+   `order.created`, `order.paid`, `order.payment.failed`,
+   `order.confirmed`, `order.driver.assigned`
+   (`app/events.py`, all workers, docs). The old
+   `order.payment_success` / `order.restaurant_confirmed` /
+   `order.delivery_assigned` keys are gone.
+
+4. **Correct acknowledgement semantics in all four workers.**
+   The `async with message.process(...)` + manual `ack()`/`nack()`
+   double-settlement pattern was removed. `settle_message()`
+   (`app/worker_common.py`) uses explicit manual settlement: ack only
+   after the worker's DB transaction commits (or after the broker
+   confirms the retry copy); poison messages raise
+   `NonRetryableError` and are rejected straight to the DLQ.
+
+5. **Meaningful automated tests for reliability.**
+   - `tests/test_reliability.py` (21 tests, mocked broker): routing-key
+     contract, retry policy, topology declaration arguments, ack
+     semantics, atomic idempotency, `connect()` contract.
+   - `tests/test_integration_live.py` (4 tests, marked `live`,
+     skipped without services): real-broker topology, outbox →
+     payment end-to-end slice, poison → DLQ, retry exhaustion →
+     DLQ + `FAILED`.
+   - `docs/TESTING.md` documents exactly what is mocked, what is
+     SQLite, and what requires live services.
+
+### P1 fixes
+
+6. **Explicit publisher confirms.** `connect_robust(...,
+   publisher_confirms=True)`; the outbox publisher marks rows
+   `published='Y'` only after the broker confirms (with a publish
+   timeout). The previous "confirms are on by default" assumption was
+   incorrect.
+7. **Atomic idempotency.** `claim_event()` performs a single
+   `INSERT ... ON CONFLICT DO NOTHING` on
+   `processed_events(event_id, worker_type)` inside the worker's
+   transaction — safe across redeliveries and concurrent worker
+   instances (verified with an 8-thread race on PostgreSQL 16:
+   exactly one winner). The old check-then-insert race is gone.
+8. **Health check scope.** `GET /health` now reports `database` and
+   `rabbitmq` separately plus an overall `ok`/`degraded` status, and
+   its scope (DB ping + AMQP handshake) is documented.
+9. **Docs/demo.** Routing keys corrected everywhere; missing
+   `docs/REQUIREMENTS_CHECKLIST.md` and `docs/TESTING.md` added;
+   `demo.sh` extended with status polling, DLQ inspection, poison →
+   DLQ, duplicate delivery, notification downtime, and
+   `--scale worker=3` multi-instance demos; Compose now defines
+   `api`, `publisher`, and `worker` services.
+
+### Remaining limitations (not fixed in this pass)
+
+- The notification worker logs to console; notifications are not
+  persisted to a `notifications` table.
+- `POST /orders` with a duplicate `Idempotency-Key` returns 201
+  instead of 200.
+- Workers use synchronous SQLAlchemy sessions inside async callbacks
+  (acceptable at this scale; async engine is a follow-up).
+- `alembic` is pinned but unused; schema is created via `create_all`.
+  Existing databases must be recreated to pick up `OrderStatus.FAILED`.
+- Live-broker tests were not executed in the fix environment (no
+  RabbitMQ available); they are marked `live` and run wherever
+  `docker compose up` provides the broker.

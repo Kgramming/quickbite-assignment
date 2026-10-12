@@ -1,4 +1,10 @@
-"""Outbox publisher: polls database and publishes events to RabbitMQ."""
+"""Outbox publisher: polls database and publishes events to RabbitMQ.
+
+The publisher only marks an outbox row ``published='Y'`` after the broker
+confirms receipt (publisher confirms are enabled on the connection), so
+a row marked published is guaranteed to be in RabbitMQ. Rows left at
+``'N'`` are retried on the next poll.
+"""
 
 import asyncio
 import json
@@ -9,11 +15,13 @@ import aio_pika
 
 from app.config import settings
 from app.database import SessionLocal
-from app.events import EVENT_ROUTING_KEYS, EventType
+from app.events import OUTBOX_ROUTING_KEYS, QUEUE_CONFIG
 from app.models import OutboxEvent
 from app.rabbitmq import RabbitMQManager
 
 logger = logging.getLogger(__name__)
+
+PUBLISH_TIMEOUT_SECONDS = 10
 
 
 class OutboxPublisher:
@@ -24,7 +32,7 @@ class OutboxPublisher:
         Initialize the outbox publisher.
 
         Args:
-            rabbitmq_manager: RabbitMQ manager instance
+            rabbitmq_manager: Connected RabbitMQ manager (confirms enabled)
             poll_interval: How often to poll for unpublished events (seconds)
         """
         self.rabbitmq = rabbitmq_manager
@@ -35,10 +43,13 @@ class OutboxPublisher:
         """Publish all unpublished outbox events to RabbitMQ."""
         session = SessionLocal()
         try:
-            # Query all unpublished events
-            unpublished = session.query(OutboxEvent).filter(
-                OutboxEvent.published == "N"
-            ).all()
+            # Query all unpublished events, oldest first for ordering.
+            unpublished = (
+                session.query(OutboxEvent)
+                .filter(OutboxEvent.published == "N")
+                .order_by(OutboxEvent.created_at)
+                .all()
+            )
 
             if not unpublished:
                 return
@@ -47,9 +58,15 @@ class OutboxPublisher:
 
             for outbox_event in unpublished:
                 try:
-                    # Determine routing key based on event type
-                    event_type = outbox_event.event_type
-                    routing_key = EVENT_ROUTING_KEYS.get(event_type, f"order.{event_type}")
+                    # Resolve routing key from the explicit allow-list.
+                    # Unknown event types are never published silently.
+                    routing_key = OUTBOX_ROUTING_KEYS.get(outbox_event.event_type)
+                    if routing_key is None:
+                        logger.error(
+                            f"Unknown event_type '{outbox_event.event_type}' "
+                            f"for outbox event {outbox_event.id}; leaving unpublished"
+                        )
+                        continue
 
                     # Create AMQP message
                     message = aio_pika.Message(
@@ -64,18 +81,22 @@ class OutboxPublisher:
                         },
                     )
 
-                    # Publish with confirmation
+                    # Publish with broker confirmation: with publisher
+                    # confirms enabled, this raises if the broker nacks
+                    # (or on timeout), so the row below is only marked
+                    # published after the broker has accepted the message.
                     await self.rabbitmq.exchange.publish(
                         message,
                         routing_key=routing_key,
+                        timeout=PUBLISH_TIMEOUT_SECONDS,
                     )
 
                     logger.info(
                         f"Published event {outbox_event.id} "
-                        f"(type: {event_type}, routing_key: {routing_key})"
+                        f"(type: {outbox_event.event_type}, routing_key: {routing_key})"
                     )
 
-                    # Mark as published AFTER confirmation
+                    # Mark as published ONLY after broker confirmation.
                     outbox_event.published = "Y"
                     outbox_event.published_at = datetime.utcnow()
                     session.add(outbox_event)
@@ -84,7 +105,7 @@ class OutboxPublisher:
                 except Exception as e:
                     logger.error(f"Failed to publish event {outbox_event.id}: {e}")
                     session.rollback()
-                    # Leave unpublished=N so it will be retried
+                    # Leave published='N' so it will be retried on next poll.
 
         finally:
             session.close()
@@ -134,14 +155,12 @@ async def run_outbox_publisher(poll_interval: float = 2.0):
     )
 
     logger.info(f"Connecting to RabbitMQ at {settings.rabbitmq_host}:{settings.rabbitmq_port}")
+    # connect() returns the manager (and raises if the broker is unreachable).
     rabbitmq = await RabbitMQManager(rabbitmq_url).connect()
 
-    # Declare topology
-    await rabbitmq.declare_queue("payment.queue", [EVENT_ROUTING_KEYS[EventType.ORDER_CREATED]])
-    await rabbitmq.declare_queue("restaurant.queue", [EVENT_ROUTING_KEYS[EventType.PAYMENT_SUCCESS]])
-    await rabbitmq.declare_queue("delivery.queue", [EVENT_ROUTING_KEYS[EventType.RESTAURANT_CONFIRMED]])
-    await rabbitmq.declare_queue("notification.queue", ["order.#"])
-    await rabbitmq.declare_dead_letter_queue()
+    # Declare retry + DLQ topology and all worker queues/bindings.
+    # Single source of truth shared with the worker service.
+    await rabbitmq.declare_application_topology(QUEUE_CONFIG)
 
     publisher = OutboxPublisher(rabbitmq, poll_interval=poll_interval)
 

@@ -23,6 +23,5 @@ COPY app/ ./app/
 ENV PYTHONUNBUFFERED=1
 ENV LOG_LEVEL=info
 
-# Default command: start a worker (will be overridden for each worker type)
-# Workers are implemented in Phase 2
-CMD ["python", "-m", "app.workers"]
+# Default command: run all four workers (override per service in compose)
+CMD ["python", "-m", "app.worker_service"]
